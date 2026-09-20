@@ -1,23 +1,8 @@
 #!/usr/bin/env python3
-"""
-JADE: Judge-free Alignment via Data Embeddings
-Version 4.0 — HelpSteer2/UltraFeedback/Prometheus streaming + H200-optimized
-(authoritative version string is __version__ below)
-"""
-
-# =============================================================================
-# VERSION — Change this EVERY time you update the code.
-# The run script and Docker startup will print this so you can verify
-# you're running the right version. No more stale Docker images.
-# =============================================================================
 __version__ = "4.0.0"
 __build_date__ = "2026-07-06"
 
 import os
-# Fix 2/3: reduce CUDA allocator fragmentation. MUST be set before torch initializes
-# CUDA. expandable_segments lets the allocator grow/shrink one segment instead of
-# reserving many fixed-size blocks that can't be reused across variable-length
-# sequences — that reserved-pool creep is what shrank our headroom over 6 hours.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import sys
 import json
@@ -47,9 +32,6 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
-
-# PyTorch 2.6+ Compatibility Patch
-# (uses setattr/getattr to avoid type-checker warnings on private attrs)
 if not hasattr(torch, '_real_original_load'):
     setattr(torch, '_real_original_load', torch.load)
     def _patched_torch_load(*args, **kwargs):
@@ -89,21 +71,12 @@ class Config:
     beta_end: float = 0.6
     gamma_start: float = 0.1
     gamma_end: float = 0.3
-    # H200-safe defaults: batch_size=1 keeps peak VRAM low because compute_log_probs
-    # retains one autograd graph per (batch_size * grpo_k) candidate until backward.
-    # batch_size=1, grad_accum=4, batches_per_epoch=500 is training-equivalent to the
-    # old 2/2/250 (same effective batch=4, same 375 optimizer steps, same samples/epoch)
-    # but holds 16 graphs per step instead of 32 — ~half the training-time memory.
     batch_size: int = 1
     epochs: int = 3
     batches_per_epoch: int = 500
     learning_rate: float = 1e-5
     gradient_accumulation_steps: int = 4
-    # Fix 1 (the real OOM fix): cap how many full-model autograd graphs are alive at
-    # once in the policy-gradient backward. The old code held batch_size*K graphs; this
-    # processes log-probs + backward in chunks of this size (peak memory ∝ chunk, not K).
     logprob_chunk_size: int = 4
-    # Observability
     log_every: int = 25          # console summary + training_history.json snapshot cadence (steps)
     checkpoint_every: int = 0    # save actor_latest every N steps (0 = off) -> weights survive a crash
     warmup_ratio: float = 0.05
@@ -120,17 +93,17 @@ class Config:
     lora_rank: int = 32
     lora_alpha: int = 64
     lora_dropout: float = 0.05
-    lora_targets: str = "auto"  # "auto" detects from model, or comma-separated
+    lora_targets: str = "auto"
     use_contrastive: bool = True
-    quantization: str = "auto"  # "auto", "4bit", "8bit", "fp16", "bf16"
-    use_armo: bool = True          # load ArmoRM for independent evaluation
-    max_test_per_tier: int = 500   # test samples per rating tier (was hardcoded 150)
-    eval_baseline: bool = False    # skip training, evaluate unmodified base model only
-    load_actor: str = ""           # path to a trained LoRA (checkpoints/actor_best) -> EVAL-ONLY, no retrain
-    load_orli: str = ""            # path to a saved orli_judge.pt -> reuse it instead of retraining ORLI
-    use_retrieval: bool = True     # FAISS retrieval scaffold; disable for clean null condition
-    orli_val_frac: float = 0.1     # fraction of TRAIN held out for ORLI early-stopping/MAE
-    keep_checkpoints: int = 0      # keep N most recent actor checkpoints; 0 = keep all
+    quantization: str = "auto" 
+    use_armo: bool = True        
+    max_test_per_tier: int = 500 
+    eval_baseline: bool = False   
+    load_actor: str = ""          
+    load_orli: str = ""           
+    use_retrieval: bool = True   
+    orli_val_frac: float = 0.1    
+    keep_checkpoints: int = 0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     run_dir: str = field(default="", init=False)
 
@@ -200,11 +173,6 @@ def json_serializable(obj):
         return bool(obj)
     return str(obj)
 
-
-# =============================================================================
-# Intent Classification (used when streaming Prometheus at runtime)
-# =============================================================================
-
 INTENT_PATTERNS = {
     'Coding': ['code', 'python', 'program', 'function', 'algorithm', 'debug',
                'javascript', 'sql', 'html', 'css', 'api', 'class', 'implement',
@@ -242,11 +210,6 @@ def classify_intent(text: str) -> str:
             return intent
     return "Question Answering" if '?' in text else "General"
 
-
-# =============================================================================
-# Dataset Loading — HuggingFace Streaming + Local CSV
-# =============================================================================
-
 KNOWN_DATASETS = {
     'prometheus':    'prometheus-eval/Feedback-Collection',
     'helpsteer2':    'nvidia/HelpSteer2',
@@ -255,20 +218,6 @@ KNOWN_DATASETS = {
 
 
 def load_prometheus(target_per_level: int, seed: int, logger: logging.Logger) -> pd.DataFrame:
-    """Load Prometheus Feedback Collection from HuggingFace and balance in-memory.
-
-    No separate download step needed — the professor just runs main.py and
-    the dataset streams automatically on first run (~200MB cached by HuggingFace).
-
-    Prometheus: 100K samples, exactly 20K per score level (1-5).
-    The dataset has NO top-level 'score'/'instruction'/'output' rating fields in the
-    JADE sense — the columns we need are the orig_* ones:
-      orig_instruction = the task prompt        -> user
-      orig_response    = the response being rated-> chatgpt_after
-      orig_score       = the 1-5 score (string) -> rating
-    (The plain 'instruction'/'output' columns are the assembled judge prompt and the
-    judge's feedback text, which are NOT what we want to score.)
-    """
     try:
         from datasets import load_dataset
     except ImportError:
@@ -285,8 +234,6 @@ def load_prometheus(target_per_level: int, seed: int, logger: logging.Logger) ->
     records = []
     skipped = 0
     for i, entry in enumerate(ds):
-        # Use the orig_* columns (the actual task/response/score), not the
-        # assembled judge prompt ('instruction') or judge feedback ('output').
         instruction = (entry.get('orig_instruction', '') or '').strip()
         response = (entry.get('orig_response', '') or '').strip()
         score_raw = entry.get('orig_score', None)
@@ -330,14 +277,6 @@ def load_prometheus(target_per_level: int, seed: int, logger: logging.Logger) ->
 
 
 def load_helpsteer2(target_per_level: int, seed: int, logger: logging.Logger) -> pd.DataFrame:
-    """Load HelpSteer2 from HuggingFace and balance in-memory.
-
-    HelpSteer2 (NVIDIA, ~21K samples): human-annotated (query, response) pairs rated on
-    5 dimensions: helpfulness, correctness, coherence, complexity, verbosity (all 0-4).
-    We use helpfulness as the primary quality signal, converting 0-4 → 1-5.
-
-    First run downloads ~500MB; subsequent runs use HuggingFace cache.
-    """
     try:
         from datasets import load_dataset
     except ImportError:
@@ -398,14 +337,6 @@ def load_helpsteer2(target_per_level: int, seed: int, logger: logging.Logger) ->
 
 
 def load_ultrafeedback(target_per_level: int, seed: int, logger: logging.Logger) -> pd.DataFrame:
-    """Load UltraFeedback from HuggingFace and balance in-memory.
-
-    UltraFeedback (OpenBMB): ~64K prompts × 4 model completions = ~256K pairs.
-    Each completion rated 1-5 on helpfulness, honesty, instruction_following, truthfulness.
-    We use the average of available dimension ratings as the composite quality score.
-
-    First run downloads ~2GB; subsequent runs use HuggingFace cache.
-    """
     try:
         from datasets import load_dataset
     except ImportError:
@@ -548,10 +479,6 @@ def load_and_split_data(config: Config, logger: logging.Logger) -> Tuple[pd.Data
         pct = count / len(df) * 100
         logger.info(f"  {r}: {count:5d} ({pct:5.1f}%)")
 
-    # ---- Stratified 3-way split: train / orli_val / test ----
-    # orli_val is held out for ORLI early-stopping and per-tier MAE so we never
-    # report ORLI calibration on the same data it was tuned on (no leakage), and
-    # it is also disjoint from the GRPO/memory train set.
     train_dfs, orli_val_dfs, test_dfs = [], [], []
     for rating in sorted(df['rating'].unique()):
         rating_df = df[df['rating'] == rating]
@@ -559,11 +486,9 @@ def load_and_split_data(config: Config, logger: logging.Logger) -> Tuple[pd.Data
             train_dfs.append(rating_df)
             continue
         n_test = max(1, int(len(rating_df) * 0.2))
-        # Cap test set per tier (configurable via --max_test_per_tier, default 500)
         if n_test > config.max_test_per_tier:
             n_test = config.max_test_per_tier
         train_pool, test_r = train_test_split(rating_df, test_size=n_test, random_state=config.seed)
-        # Carve ORLI validation out of the remaining train pool (stratified by rating).
         n_val = max(1, int(len(train_pool) * config.orli_val_frac))
         if n_val >= len(train_pool):
             n_val = max(1, len(train_pool) - 1)
@@ -749,11 +674,7 @@ def _ridge_probe(train_ds, val_ds, device, lam: float = 10.0):
 
 
 class ORLIJudge(nn.Module):
-    """5-layer residual MLP for quality scoring.
-    Architecture: 1024 → 512 → 512 → 256 → 256 → 1
-    Residual connections at same-dimension layers (512→512, 256→256)
-    to prevent vanishing gradients and refine representations incrementally.
-    """
+
     def __init__(self, config: Config):
         super().__init__()
         dim = orli_feature_dim(config)  # 1024 ('pair'/'response') or 2048 ('concat')
@@ -800,7 +721,6 @@ class ORLIJudge(nn.Module):
 class ORLIDataset(Dataset):
     def __init__(self, df: pd.DataFrame, encoder: Encoder, config: Config):
         self.samples = []
-        # Same feature builder used at inference (encode_response_pair) — no drift.
         all_embs = build_orli_features(encoder, df['user'].tolist(), df['chatgpt_after'].tolist(), config)
         for i, (_, row) in enumerate(df.iterrows()):
             self.samples.append({
@@ -828,7 +748,6 @@ def train_orli_judge(judge: ORLIJudge, train_df: pd.DataFrame, val_df: pd.DataFr
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.orli_epochs)
     device = config.device
     judge = judge.to(device)
-    # Inverse-frequency class weights counter the 4-5-star skew (Cause 3 in ORLI_DEEP_DIVE.md).
     tier_w = {}
     if config.orli_balance:
         vc = train_df['rating'].astype(int).value_counts().to_dict()
@@ -911,7 +830,6 @@ def train_orli_judge(judge: ORLIJudge, train_df: pd.DataFrame, val_df: pd.DataFr
             logger.info(f"  {tier_rating}-star MAE: {tier_mae:.3f}  (N={len(tier_df)})")
     history['per_tier_mae'] = per_tier_mae
 
-    # ---- ORLI diagnostic metrics: prediction spread + correlation with the ratings ----
     judge.eval()
     vp, vt = [], []
     with torch.no_grad():
@@ -1054,10 +972,8 @@ class Actor:
     def format_prompt(self, query: str, context: str = "", state: str = "neutral", prev_msg: str = "") -> str:
         query = safe_truncate(query, self.config.max_user_chars)
         context = safe_truncate(context, self.config.max_context_chars)
-        # Detect dataset domain from data path for appropriate system prompt
         data_path_lower = self.config.data_path.lower()
         if 'recipe' in data_path_lower:
-            # Original academic writing tutoring domain
             role = "a helpful academic writing tutor"
             state_instructions = {
                 "engaged": "The student is progressing well. Provide encouraging guidance.",
@@ -1144,10 +1060,6 @@ class Actor:
         self.tokenizer.save_pretrained(path)
 
     def load_adapter(self, path: str):
-        """Load a trained LoRA adapter from a previous run's checkpoints/actor_*/ and make it
-        active. Used by --load_actor for EVAL-ONLY re-runs (~3 h) on an already-trained actor,
-        instead of a full ~37 h retrain. The base model + a fresh LoRA are already built here;
-        we just load the trained weights on top and switch to them."""
         self.model.load_adapter(path, adapter_name="loaded", is_trainable=False)
         self.model.set_adapter("loaded")
         self.logger.info(f"Loaded trained actor LoRA from {path} (active adapter = 'loaded')")
@@ -1317,10 +1229,6 @@ class GRPOTrainer:
                 all_contrastive_rewards.append(contrastive_r)
                 all_sim_rewards.append(sim_reward)
                 all_orli_rewards.append(orli_reward)
-                # Three-component blended reward. With --protect_high_ratings, scale the
-                # imitation (similarity-to-gold) weight UP for already-high-rated sources so the
-                # actor stays close to the good gold answer (don't degrade 5-star), and DOWN for
-                # low-rated sources so it has room to improve them. (rating 1->0.7a ... 5->1.1a)
                 alpha_eff = alpha * (0.6 + 0.1 * sample['rating']) if self.config.protect_high_ratings else alpha
                 final_reward = (alpha_eff * sim_reward) + (beta * orli_reward) + (gamma * contrastive_r)
                 all_rewards.append(final_reward)
@@ -1333,13 +1241,6 @@ class GRPOTrainer:
         std = rewards_grouped.std(dim=1, keepdim=True) + 1e-8
         advantages = ((rewards_grouped - mean) / std).view(-1)
         is_weights_expanded = torch.tensor(is_weights, device=self.device, dtype=torch.float).repeat_interleave(self.config.grpo_k)
-        # ---- Fix 1: memory-bounded policy-gradient update (chunked over candidates) ----
-        # The single-shot version held one full Qwen-7B forward graph PER candidate
-        # (batch_size*K of them) alive until backward — that stack of graphs is what
-        # filled the H200. Here we compute log-probs and back-propagate in chunks of
-        # `logprob_chunk_size`, so at most that many graphs are alive at once.
-        # Gradient is linear, so the SUM of the per-chunk backward passes is EXACTLY the
-        # gradient of the original mean loss -> identical training, bounded peak memory.
         N = len(flat_responses)  # = (#samples in batch) * K
         chunk = max(1, self.config.logprob_chunk_size)
         adv_detached = advantages.detach()
@@ -1406,9 +1307,6 @@ class GRPOTrainer:
         }
 
     def _log_step_memory(self, mem_csv: str, epoch: int):
-        """Append this step's GPU memory to memory.csv (and log a line every 25 steps).
-        end_alloc = live tensors after the step (should be FLAT if there is no leak);
-        peak_alloc = the step's peak (should be FLAT if chunking bounds it)."""
         if not torch.cuda.is_available():
             return
         end_alloc = torch.cuda.memory_allocated() / 1e9
@@ -1469,14 +1367,9 @@ class GRPOTrainer:
         self.logger.info(f"LR schedule: cosine with {self.config.warmup_ratio*100:.0f}% warmup")
         self.logger.info(f"Log-prob chunk size: {self.config.logprob_chunk_size} "
                          f"(at most this many full-model graphs alive at once)")
-        # Per-step GPU memory log -> logs/memory.csv (feed to check_memory.py for the
-        # plateau-vs-climb verdict; this is the 15-min smoke test, not a 6-hour gamble).
         mem_csv = os.path.join(self.config.run_dir, "logs", "memory.csv")
         with open(mem_csv, "w") as _mf:
             _mf.write("step,epoch,end_alloc_gb,peak_alloc_gb,reserved_gb\n")
-        # Per-step training metrics -> logs/metrics.csv (flushed every step). This is the
-        # machine-readable record that survives a crash, so even a half-finished run is
-        # decision-useful (open it in any spreadsheet / pandas).
         metrics_csv = os.path.join(self.config.run_dir, "logs", "metrics.csv")
         with open(metrics_csv, "w") as _mf:
             _mf.write("step,epoch,loss,reward,reward_sim,reward_orli,reward_contrastive,"
@@ -1615,17 +1508,6 @@ def apply_armorm_compat_shim(logger: Optional[logging.Logger] = None) -> bool:
 
 
 def chat_template_input_ids(tokenizer, messages, max_length: int) -> torch.Tensor:
-    """Version-proof apply_chat_template -> input_ids Tensor.
-
-    transformers <=4.57 returns a plain Tensor from
-    apply_chat_template(..., return_tensors="pt"); newer versions flipped the
-    return_dict default to True and return a BatchEncoding (dict). Passing that
-    BatchEncoding straight into model(input_ids) raises
-    "embedding(): argument 'indices' ... must be Tensor, not BatchEncoding".
-    This helper normalizes BOTH behaviors to the input_ids Tensor. It is the ONLY
-    sanctioned way to tokenize chat for ArmoRM here — check_armorm.py reuses it so
-    the pre-flight exercises the exact code path of the real run.
-    """
     enc = tokenizer.apply_chat_template(
         messages, return_tensors="pt", truncation=True, max_length=max_length,
     )
@@ -1639,15 +1521,6 @@ def chat_template_input_ids(tokenizer, messages, max_length: int) -> torch.Tenso
 
 
 class ArmoRMEvaluator:
-    """Second, independent evaluation metric using RLHFlow/ArmoRM-Llama3-8B-v0.1.
-
-    ArmoRM is a held-out reward model (trained by RLHFlow on separate human-preference
-    data) reported alongside ORLI as an independent quality signal.
-
-    Model: RLHFlow/ArmoRM-Llama3-8B-v0.1 (~16GB in bf16)
-    Output: scalar preference score (higher = better quality response)
-    H200 note: loads in bf16 alongside the actor without memory conflict.
-    """
 
     def __init__(self, config: Config, logger: logging.Logger):
         logger.info("=" * 70)
@@ -1681,9 +1554,6 @@ class ArmoRMEvaluator:
         self.n_fail = 0
         self._warned = False
         logger.info(f"ArmoRM loaded. GPU memory after load: {get_gpu_memory()}")
-        # FAIL-FAST self-test: score one dummy pair NOW. A scoring/version issue then aborts in
-        # seconds, instead of failing silently on every example for a multi-hour eval and
-        # producing an ORLI-only result (the exact loop that wasted earlier runs).
         _t = self.score("What is the capital of France?", "The capital of France is Paris.")
         self.n_total = 0; self.n_fail = 0; self._warned = False  # reset stats after the self-test
         if _t is None:
@@ -1697,15 +1567,7 @@ class ArmoRMEvaluator:
 
     @torch.no_grad()
     def score(self, query: str, response: str) -> Optional[float]:
-        """Score a (query, response) pair. Returns the raw ArmoRM preference scalar,
-        or None on failure (caller/aggregation must skip None values).
 
-        Tokenization is single-step via chat_template_input_ids() (which wraps
-        apply_chat_template) to match the official ArmoRM usage AND normalize the
-        Tensor-vs-BatchEncoding return-type change across transformers versions.
-        The earlier two-step (tokenize=False then re-tokenize) path injected a
-        duplicate BOS token and shifted every score.
-        """
         self.n_total += 1
         messages = [
             {"role": "user", "content": safe_truncate(query, 1500)},
@@ -1759,9 +1621,6 @@ class Evaluator:
             gold_response = safe_truncate(str(row['chatgpt_after']), self.config.max_response_chars)
             prev_msg = safe_truncate(str(row.get('chatgpt_before', '')), 300)
             rating = int(row['rating'])
-            # Retrieval scaffold is part of JADE; --no_retrieval removes it so that
-            # eval_baseline + no_retrieval gives the rawest null condition for the
-            # regression-to-the-mean control.
             if use_retrieval:
                 ret = self.memory.retrieve(query, source_rating=rating)
                 context_str, state = ret['context_str'], ret['state']
@@ -2232,26 +2091,7 @@ def main():
     parser = argparse.ArgumentParser(
         description='JADE v4: Judge-free Alignment via Data Embeddings',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Dataset options (--data_path):
-  helpsteer2     — nvidia/HelpSteer2, human-rated ~21K pairs (PRIMARY)
-  ultrafeedback  — openbmb/UltraFeedback, GPT-4 rated ~256K pairs (SECOND)
-  prometheus     — prometheus-eval/Feedback-Collection, GPT-4 rubric ~100K (THIRD)
-  ./file.csv     — local CSV file (e.g. Recipe4U fallback)
-
-Example runs:
-  # Primary: HelpSteer2, full training + ArmoRM evaluation
-  python main.py --data_path helpsteer2 --k 16 --epochs 3
-
-  # Null baseline: establish regression-to-the-mean control (no training)
-  python main.py --data_path helpsteer2 --eval_baseline
-
-  # SFT-only: similarity reward only, no ORLI
-  python main.py --data_path helpsteer2 --beta_start 0 --beta_end 0 --gamma_start 0 --gamma_end 0
-
-  # Recipe4U fallback (local CSV)
-  python main.py --data_path ./data/recipe4u.csv --no_armo
-        """
+        epilog=
     )
     # Core
     parser.add_argument('--k', type=int, default=16, help='GRPO group size K')
